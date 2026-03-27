@@ -431,6 +431,11 @@ Found a bug or have a feature request? [Open an issue](https://github.com/aaravs
 [![Portfolio](https://img.shields.io/badge/Portfolio-aaravshah1311.is--great.net-0ea5e9?style=flat)](https://aaravshah1311.is-great.net)
 [![Email](https://img.shields.io/badge/Email-aaravprogrammers%40gmail.com-EA4335?style=flat&logo=gmail)](mailto:aaravprogrammers@gmail.com)
 
+**Rudra Marathe**
+[![GitHub](https://img.shields.io/badge/GitHub-RudraDelete26-181717?style=flat&logo=github)](https://github.com/RudraDelete26/)
+[![Portfolio](https://img.shields.io/badge/Portfolio-rudraxdelete.is-great.net-0ea5e9?style=flat)](https://rudraxdelete.is-great.net)
+[![Email](https://img.shields.io/badge/Email-rudranmarathegpsagb%40gmail.com-EA4335?style=flat&logo=gmail)](mailto:rudranmarathegpsagb@gmail.com)
+
 **Naitik Soni**
 [![GitHub](https://img.shields.io/badge/GitHub-Naitiksoni--123-181717?style=flat&logo=github)](https://github.com/Naitiksoni-123/)
 [![Email](https://img.shields.io/badge/Email-naitiksoni1417%40gmail.com-EA4335?style=flat&logo=gmail)](mailto:naitiksoni1417@gmail.com)

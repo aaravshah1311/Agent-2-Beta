@@ -107,8 +107,8 @@ agent2/
 ### 1 — Clone
 
 ```bash
-git clone https://github.com/aaravshah1311/agent2.git
-cd agent2
+git https://github.com/aaravshah1311/Agent-2-Beta.git
+cd Agent-2-Beta
 ```
 
 ### 2 — Run the launcher
@@ -420,7 +420,7 @@ Contributions are welcome and appreciated! Agent-2-Beta is open to improvements 
 
 ### Report issues
 
-Found a bug or have a feature request? [Open an issue](https://github.com/aaravshah1311/agent2/issues) — please include your OS, Python version, and the exact error message.
+Found a bug or have a feature request? [Open an issue](https://github.com/aaravshah1311/Agent-2-Beta/issues) — please include your OS, Python version, and the exact error message.
 
 ---
 

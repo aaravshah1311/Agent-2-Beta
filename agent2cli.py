@@ -14,23 +14,20 @@ Commands:
   /addapi        add an API key to .env
   /model [name]  switch model
   /mode  [name]  switch mode (fast | pro | thinking)
-  /clear         clear current conversation
+  /clear         clear conversation (start fresh)
+  /shrink        summarize & shrink history manually
+  /scan <path>   scan and analyze entire project
   /history       show recent messages
   /clearhistory  clear message history
   /memory        list saved memories
   /addmem <txt>  add a memory
-  /workspace [p] show or set working directory
   /run <cmd>     run a shell command directly
   /read <file>   read a file
-  /write <f>     write to a file
-  /ls [path]     list directory
-  /analyze <p>   analyze a project
   /search <q>    web search
   /exit          quit
 """
 
 import os, sys, re, json, shutil, threading, time, platform
-from turtle import clearscreen
 import subprocess, urllib.request, urllib.parse
 from pathlib import Path
 from datetime import datetime
@@ -78,26 +75,33 @@ except ImportError:
     _con  = None
 
 # ── prompt_toolkit ─────────────────────────────────────────────────────────────
+# Imported lazily/optionally so commands like `--help` and `/addapi` can still
+# work on a fresh machine before optional CLI dependencies are installed.
 try:
     from prompt_toolkit import PromptSession
     from prompt_toolkit.history import FileHistory
-    from prompt_toolkit.completion import WordCompleter
     from prompt_toolkit.formatted_text import HTML
     from prompt_toolkit.styles import Style
     _PTK = True
-except ImportError:
-    print("\n  [ERR]  prompt-toolkit not installed.")
-    print("         Run:  pip install prompt-toolkit\n")
-    sys.exit(1)
+    _PTK_IMPORT_ERROR = None
+except ImportError as ex:
+    PromptSession = FileHistory = HTML = Style = None
+    _PTK = False
+    _PTK_IMPORT_ERROR = ex
 
 # ── Gemini ─────────────────────────────────────────────────────────────────────
+# Do not exit at import time. This lets `python agent2cli.py --help` work even
+# when google-genai has not been installed yet. Agent calls validate this later.
 try:
     import google.genai as genai
     from google.genai import types as gtypes
-except ImportError:
-    print("\n  [ERR]  google-genai not installed.")
-    print("         Run:  python run.py --cli   (it installs everything)\n")
-    sys.exit(1)
+    _GENAI = True
+    _GENAI_IMPORT_ERROR = None
+except ImportError as ex:
+    genai = None
+    gtypes = None
+    _GENAI = False
+    _GENAI_IMPORT_ERROR = ex
 
 # ── ANSI colour helpers ────────────────────────────────────────────────────────
 R  = "\033[0m"; B  = "\033[1m"; D  = "\033[2m"
@@ -188,17 +192,17 @@ def save_key_to_env(new_key: str) -> tuple[bool, str]:
     if new_key in existing_vals:
         return False, "already exists"
     env = _read_env()
-    # find next free slot
-    used_names = {n for n in env if re.match(r"^GEMINI_API_KEY", n)}
-    label = 1
+    # Find the next free slot: GEMINI_API_KEY, GEMINI_API_KEY_2, ...
+    used_names = {n for n in env if re.match(r"^GEMINI_API_KEY(?:_\d+)?$", n)}
+    slot = 1
     while True:
-        name = "GEMINI_API_KEY" if label == 1 else f"GEMINI_API_KEY_{label+1}"
+        name = "GEMINI_API_KEY" if slot == 1 else f"GEMINI_API_KEY_{slot}"
         if name not in used_names:
             break
-        label += 1
+        slot += 1
     env[name] = new_key
     _write_env(env)
-    return True, str(label)
+    return True, str(slot)
 
 # ── Key rotator (in-memory, seeded from .env) ──────────────────────────────────
 class KeyRotator:
@@ -214,11 +218,15 @@ class KeyRotator:
 
     def get(self) -> tuple:
         """Return (client, raw_key, label) — picks first active key."""
+        if not _GENAI:
+            return None, None, None
         with self._lock:
             active = [e for e in self._entries if e["active"]]
             if not active:
                 # reset all and retry once
-                for e in self._entries: e["active"] = True; e["errs"] = 0
+                for e in self._entries:
+                    e["active"] = True
+                    e["errs"] = 0
                 active = self._entries
             if not active:
                 return None, None, None
@@ -236,6 +244,8 @@ class KeyRotator:
 
     def next_active(self, current_key: str) -> tuple:
         """After a failure, get the next different active key."""
+        if not _GENAI:
+            return None, None, None
         with self._lock:
             active = [e for e in self._entries if e["active"] and e["key"] != current_key]
             if not active:
@@ -327,16 +337,14 @@ def print_help():
         ("/model [name]",     "Switch model  (2.5-flash-lite | 2.5-flash | 2.5-pro | 3.1-*)"),
         ("/mode [name]",      "Switch mode   (fast ⚡ | pro ★ | thinking 🧠)"),
         ("/clear",            "Clear conversation (start fresh)"),
+        ("/shrink",           "Summarize and shrink history manually"),
+        ("/scan <path>",      "Scan and analyze entire project directory"),
         ("/history",          "Show last 10 messages"),
         ("/clearhistory",     "Clear message history"),
         ("/memory",           "List all saved memories"),
         ("/addmem <text>",    "Save a memory manually"),
-        ("/workspace [path]", "Show or set working directory for commands"),
         ("/run <cmd>",        "Run a shell command directly"),
         ("/read <file>",      "Read a file's contents"),
-        ("/write <file>",     "Write text to a file (prompts for content)"),
-        ("/ls [path]",        "List directory tree"),
-        ("/analyze <path>",   "Detect framework / language / run command"),
         ("/search <query>",   "Web search (DuckDuckGo)"),
         ("/keys",             "Show API key status"),
         ("/exit  or  Ctrl+C", "Quit"),
@@ -396,7 +404,7 @@ def _render_markdown_plain(text: str):
 
 def print_tool_call(name: str, desc: str, detail: str = ""):
     icons = {"run_command":"⚙️","read_file":"📄","write_file":"✏️",
-             "list_directory":"📁","analyze_project":"🔍",
+             "scan_project":"🔍","multi_edit_files":"✂️",
              "web_search":"🌐","save_memory":"🧠","emit_plan":"📋"}
     icon = icons.get(name, "🔧")
     if _RICH:
@@ -424,6 +432,32 @@ def print_plan(title: str, steps: list):
         for i, s in enumerate(steps, 1):
             print(f"  {PU}{i}.{R} {s}")
         print()
+
+# ── Esc Interrupter ────────────────────────────────────────────────────────────
+import _thread
+
+class EscInterrupter:
+    """Listens for ESC key in the background to interrupt processing."""
+    def __init__(self):
+        self._stop = threading.Event()
+        self._t = threading.Thread(target=self._listen, daemon=True)
+
+    def start(self):
+        self._t.start()
+
+    def stop(self):
+        self._stop.set()
+
+    def _listen(self):
+        if not IS_WIN: return
+        import msvcrt
+        while not self._stop.is_set():
+            if msvcrt.kbhit():
+                ch = msvcrt.getch()
+                if ch in (b'\x1b', b'\x03'):  # ESC or Ctrl+C
+                    _thread.interrupt_main()
+                    break
+            time.sleep(0.05)
 
 # ── Spinner ────────────────────────────────────────────────────────────────────
 class Spinner:
@@ -521,102 +555,17 @@ def _impl_read(args: dict) -> dict:
     except Exception as ex: return {"error": str(ex)}
 
 def _impl_write(args: dict) -> dict:
-    p = Path(args["path"]).expanduser()
+    p = Path(args.get("path", "")).expanduser()
+    content = args.get("content", "")
+    if not content: return {"error": "content is required"}
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
-        mode = "a" if args.get("append") else "w"
-        with open(p, mode, encoding="utf-8") as f: f.write(args["content"])
-        return {"success": True, "path": str(p), "lines": args["content"].count("\n") + 1}
+        p.write_text(content, encoding="utf-8")
+        lines = content.count("\n") + 1
+        return {"success": True, "path": str(p), "lines": lines}
     except Exception as ex: return {"error": str(ex)}
 
-def _impl_ls(args: dict) -> dict:
-    p     = Path(args.get("path", ".")).expanduser()
-    depth = min(int(args.get("depth", 3)), 6)
 
-    def _tree(pp: Path, d: int, pfx: str = "") -> list[str]:
-        if d > depth: return []
-        lines = []
-        try:
-            entries = sorted(pp.iterdir(), key=lambda x: (x.is_file(), x.name.lower()))
-        except PermissionError:
-            return [f"{pfx}[permission denied]"]
-        for i, e in enumerate(entries[:200]):
-            if any(e.name == ig or e.name.endswith(ig.lstrip("*")) for ig in _SKIP):
-                continue
-            last    = (i == len(entries) - 1)
-            conn    = "└── " if last else "├── "
-            ext     = "    " if last else "│   "
-            if e.is_dir():
-                lines.append(f"{pfx}{conn}{e.name}/")
-                lines.extend(_tree(e, d + 1, pfx + ext))
-            else:
-                sz = e.stat().st_size
-                s  = f"{sz // 1024}KB" if sz >= 1024 else f"{sz}B"
-                lines.append(f"{pfx}{conn}{e.name} ({s})")
-        return lines
-
-    try:
-        if not p.exists(): return {"error": f"Not found: {p}"}
-        tree_lines = [str(p) + "/"] + _tree(p, 1)
-        return {"tree": "\n".join(tree_lines)}
-    except Exception as ex: return {"error": str(ex)}
-
-_FP = [
-    ("package.json",       "Node.js",        "JavaScript",      "npm",     "npm start"),
-    ("requirements.txt",   "Python",          "Python",          "pip",     "python main.py"),
-    ("pyproject.toml",     "Python",          "Python",          "pip",     "python main.py"),
-    ("manage.py",          "Django",          "Python",          "pip",     "python manage.py runserver"),
-    ("app.py",             "Flask/FastAPI",   "Python",          "pip",     "python app.py"),
-    ("Cargo.toml",         "Rust",            "Rust",            "cargo",   "cargo run"),
-    ("go.mod",             "Go",              "Go",              "go",      "go run ."),
-    ("pom.xml",            "Maven/Java",      "Java",            "mvn",     "mvn exec:java"),
-    ("next.config.js",     "Next.js",         "TypeScript",      "npm",     "npm run dev"),
-    ("vite.config.js",     "Vite",            "JavaScript",      "npm",     "npm run dev"),
-    ("vite.config.ts",     "Vite",            "TypeScript",      "npm",     "npm run dev"),
-    ("docker-compose.yml", "Docker Compose",  "Any",             "docker",  "docker-compose up"),
-    ("Dockerfile",         "Docker",          "Any",             "docker",  "docker build ."),
-    ("Makefile",           "Make/C++",        "C/C++",           "make",    "make"),
-    ("pubspec.yaml",       "Flutter",         "Dart",            "flutter", "flutter run"),
-]
-
-def _impl_analyze(args: dict) -> dict:
-    p = Path(args["path"]).expanduser()
-    if not p.exists(): return {"error": f"Not found: {p}"}
-    if not p.is_dir(): p = p.parent
-    files  = [f.name for f in p.iterdir() if f.is_file()]
-    result = {"path": str(p), "framework": None, "language": None,
-              "package_manager": None, "run_cmd": None, "deps": []}
-    for fname, fw, lang, pm, run in _FP:
-        if fname in files:
-            result.update({"framework": fw, "language": lang,
-                           "package_manager": pm, "run_cmd": run})
-            break
-    # Parse deps
-    for fp_name, parser in [
-        ("requirements.txt", lambda fp: [
-            l.strip().split(">=")[0].split("==")[0]
-            for l in fp.read_text().splitlines() if l.strip() and not l.startswith("#")
-        ]),
-        ("package.json", lambda fp: list({
-            **json.loads(fp.read_text()).get("dependencies", {}),
-            **json.loads(fp.read_text()).get("devDependencies", {}),
-        }.keys())),
-    ]:
-        fp = p / fp_name
-        if fp.exists():
-            try: result["deps"] = parser(fp)[:30]
-            except: pass
-    # Detect venv
-    for vd in ["venv", ".venv", "env"]:
-        if (p / vd).is_dir():
-            act = f"{vd}\\Scripts\\activate && " if IS_WIN else f"source {vd}/bin/activate && "
-            result["run_cmd"] = act + (result["run_cmd"] or "python main.py")
-            break
-    # README hint
-    for rname in ["README.md", "README.txt", "readme.md"]:
-        if (p / rname).exists():
-            result["readme"] = rname; break
-    return result
 
 def _impl_search(args: dict) -> dict:
     q = args.get("query", "")
@@ -651,18 +600,87 @@ def _impl_plan(args: dict) -> dict:
     print_plan(title, steps)
     return {"plan_emitted": True}
 
-def dispatch_tool(name: str, args: dict, cwd: str | None = None) -> dict:
-    if name == "read_file":       return _impl_read(args)
-    if name == "write_file":      return _impl_write(args)
-    if name == "list_directory":  return _impl_ls(args)
-    if name == "analyze_project": return _impl_analyze(args)
-    if name == "web_search":      return _impl_search(args)
-    if name == "save_memory":     return _impl_save_mem(args)
-    if name == "emit_plan":       return _impl_plan(args)
+
+def _impl_scan_project(args: dict) -> dict:
+    raw = args.get("path", ".")
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+        p = Path(os.getcwd()) / p
+    p = p.resolve()
+    if not p.exists() or not p.is_dir(): return {"error": f"Invalid directory: {p}"}
+    
+    important_exts = {".py", ".js", ".html", ".css", ".json", ".md", ".txt", ".ts", ".tsx",
+                      ".jsx", ".java", ".c", ".cpp", ".h", ".hpp", ".go", ".rs", ".rb",
+                      ".php", ".yaml", ".yml", ".toml", ".cfg", ".ini", ".env", ".sql",
+                      ".sh", ".bat", ".ps1", ".xml", ".svg", ".lock"}
+    skip_dirs = {".git", "node_modules", "venv", ".venv", "__pycache__", "dist", "build",
+                 ".next", "target", ".DS_Store", ".idea", ".vscode", "coverage", ".cache"}
+    
+    # Build a file tree first
+    tree_lines = [f"Project root: {p}"]
+    contents = []
+    total_size = 0
+    
+    import os as _os
+    for root, dirs, files in _os.walk(p):
+        dirs[:] = sorted([d for d in dirs if d not in skip_dirs])
+        level = len(Path(root).relative_to(p).parts)
+        indent = "  " * level
+        tree_lines.append(f"{indent}{Path(root).name}/")
+        for fname in sorted(files):
+            fp = Path(root) / fname
+            if fp.suffix in important_exts:
+                tree_lines.append(f"{indent}  {fname}  ({fp.stat().st_size} bytes)")
+                try:
+                    text = fp.read_text(encoding="utf-8", errors="replace")
+                    if len(text) > 50000: text = text[:50000] + "\n...[truncated]"
+                    contents.append(f"\n{'='*60}\n FILE: {fp.relative_to(p)}\n{'='*60}\n{text}")
+                    total_size += len(text)
+                    if total_size > 300000:
+                        contents.append("\n--- [TRUNCATED: Project too large, remaining files skipped] ---")
+                        break
+                except Exception:
+                    pass
+        if total_size > 300000:
+            break
+    
+    file_tree = "\n".join(tree_lines)
+    file_contents = "\n".join(contents) if contents else "No important text files found."
+    return {"file_tree": file_tree, "file_count": len(contents), "project_contents": file_contents}
+
+def _impl_multi_edit(args: dict) -> dict:
+    edits = args.get("edits", [])
+    results = []
+    for edit in edits:
+        p = Path(edit.get("path", "")).expanduser()
+        old_text = edit.get("old_text", "")
+        new_text = edit.get("new_text", "")
+        if not p.exists():
+            results.append(f"{p}: File not found")
+            continue
+        try:
+            c = p.read_text(encoding="utf-8")
+            if old_text not in c:
+                results.append(f"{p}: old_text not found")
+            else:
+                p.write_text(c.replace(old_text, new_text), encoding="utf-8")
+                results.append(f"{p}: Successfully edited")
+        except Exception as e:
+            results.append(f"{p}: Error {e}")
+    return {"results": "\n".join(results)}
+
+def dispatch_tool(name: str, args: dict) -> dict:
+    if name == "read_file":        return _impl_read(args)
+    if name == "write_file":       return _impl_write(args)
+    if name == "web_search":       return _impl_search(args)
+    if name == "save_memory":      return _impl_save_mem(args)
+    if name == "emit_plan":        return _impl_plan(args)
+    if name == "scan_project":     return _impl_scan_project(args)
+    if name == "multi_edit_files": return _impl_multi_edit(args)
     return {"error": f"Unknown tool: {name}"}
 
 # ── Gemini tool declarations ────────────────────────────────────────────────────
-def _build_tools() -> gtypes.Tool:
+def _build_tools():
     S = gtypes.Schema; T = gtypes.Type
     return gtypes.Tool(function_declarations=[
         gtypes.FunctionDeclaration(name="run_command",
@@ -680,23 +698,11 @@ def _build_tools() -> gtypes.Tool:
                 "end_line":   S(type=T.INTEGER),
             }, required=["path"])),
         gtypes.FunctionDeclaration(name="write_file",
-            description="Create or overwrite a file with content.",
+            description="Create or overwrite a file with the given content. Use for creating new files. Parent directories are created automatically.",
             parameters=S(type=T.OBJECT, properties={
                 "path":    S(type=T.STRING),
                 "content": S(type=T.STRING),
-                "append":  S(type=T.BOOLEAN),
             }, required=["path","content"])),
-        gtypes.FunctionDeclaration(name="list_directory",
-            description="List directory contents as a tree.",
-            parameters=S(type=T.OBJECT, properties={
-                "path":  S(type=T.STRING),
-                "depth": S(type=T.INTEGER),
-            }, required=["path"])),
-        gtypes.FunctionDeclaration(name="analyze_project",
-            description="Analyze a project: detect framework, language, deps, run command. Call FIRST before running any project.",
-            parameters=S(type=T.OBJECT, properties={
-                "path": S(type=T.STRING),
-            }, required=["path"])),
         gtypes.FunctionDeclaration(name="web_search",
             description="Search the web for CVEs, docs, error messages, latest info.",
             parameters=S(type=T.OBJECT, properties={
@@ -716,10 +722,24 @@ def _build_tools() -> gtypes.Tool:
                 "title": S(type=T.STRING),
                 "steps": S(type=T.STRING),
             }, required=["title","steps"])),
+        gtypes.FunctionDeclaration(name="scan_project",
+            description="Recursively scan a project directory and return a file tree + content of ALL code/config files. Use this AUTOMATICALLY whenever the user mentions a project, asks to check code, add features, or fix bugs. Pass the project path.",
+            parameters=S(type=T.OBJECT, properties={
+                "path": S(type=T.STRING),
+            }, required=["path"])),
+        gtypes.FunctionDeclaration(name="multi_edit_files",
+            description="Edit multiple files at once by replacing exact text snippets. Each edit has path, old_text (exact match), new_text (replacement). Use for renaming, refactoring, or patching across files.",
+            parameters=S(type=T.OBJECT, properties={
+                "edits": S(type=T.ARRAY, items=S(type=T.OBJECT, properties={
+                    "path": S(type=T.STRING),
+                    "old_text": S(type=T.STRING),
+                    "new_text": S(type=T.STRING)
+                }))
+            }, required=["edits"])),
     ])
 
 # ── System prompt ──────────────────────────────────────────────────────────────
-def build_sys_prompt(workspace: str | None = None) -> str:
+def build_sys_prompt() -> str:
     if IS_WIN:
         plat = ("PLATFORM: Windows / CMD+PowerShell\n"
                 "ipconfig | dir | type | python | pip | ping -n 4 | winget/choco for packages")
@@ -735,33 +755,78 @@ def build_sys_prompt(workspace: str | None = None) -> str:
         mem_block = "\n\n## MEMORIES:\n" + "\n".join(
             f"- [{m['importance']}/10] {m['content']}" for m in top)
 
-    ws_block = f"\n\n## ACTIVE WORKSPACE: {workspace}\nAll relative paths resolve here." if workspace else ""
-
-    return f"""You are Agent 2 — an elite autonomous AI development and security agent in a terminal.
+    return f"""You are Agent 2 — an elite autonomous AI development and security agent running in a terminal.
 
 {plat}
 
-## WHAT YOU CAN DO
-- Write, debug, refactor any code with full fenced code blocks
-- Execute real shell commands with live output
-- Read/write files, analyze projects, search the web
-- Run security tools: nmap, nikto, gobuster, sqlmap, hydra, metasploit
-- Remember facts across sessions with save_memory
-- Emit step-by-step plans for complex tasks
+## YOUR TOOLS (use these — do NOT just print code)
+1. **run_command** — Execute any shell command. Translate user intent to platform commands automatically:
+   - User says "ls" or "ls -a" on Windows → run `dir` or `dir /a`
+   - User says "cat file" on Windows → run `type file`
+   - User says "mkdir" → use the correct platform command
+   - ALWAYS translate Linux/Mac commands to Windows equivalents and vice versa. NEVER tell the user to "use dir instead" — just DO it.
+2. **read_file** — Read a file's contents (optionally specific line range)
+3. **write_file** — Create or overwrite a file with content. Use this to ACTUALLY write code to disk. Do NOT just show code in chat — call write_file to create the file.
+4. **scan_project** — Recursively scan a project directory. Returns file tree + all source code. Use this AUTOMATICALLY when the user:
+   - Says "check my project", "look at my code", "scan this", "add a feature to my project"
+   - Mentions any project or codebase by name or path
+   - Asks to fix bugs, refactor, or add functionality to existing code
+   - You do NOT need the user to type /scan — just call it yourself
+5. **multi_edit_files** — Precisely edit multiple files at once using find-and-replace. Each edit: {{path, old_text, new_text}}. Use for renaming, refactoring, or patching across files.
+6. **web_search** — Search the web for docs, errors, CVEs, latest info
+7. **save_memory** — Persist important facts across sessions
+8. **emit_plan** — Show a step-by-step plan before complex tasks (3+ steps)
 
-## TOOL DECISION RULES
-- Ask to run a project? → analyze_project FIRST, then run
-- Edit any existing file? → read_file FIRST
-- Task with 3+ steps? → emit_plan FIRST
-- Need current CVEs, docs, error info? → web_search
-- Learned something important? → save_memory
+## CRITICAL RULES
+- **NEVER just show code in chat and expect the user to copy-paste it.** Always use `write_file` to create files and `multi_edit_files` to edit existing files. You are an AGENT — you DO things, not just suggest things.
+- **When creating a project** (e.g. "make an e-commerce site"), use `emit_plan` first, then `write_file` for EVERY file. Create proper directory structure. Write ALL the code to disk.
+- **When editing a project**, use `scan_project` first to understand the full codebase (language, framework, DB, structure), then use `multi_edit_files` or `write_file` to make changes.
+- **When fixing bugs or testing**, `scan_project` first, deeply analyze all files for logic errors, security vulnerabilities (XSS, SQLi, CSRF, etc.), and edge cases, then fix them using `multi_edit_files`. You have full cybersecurity analysis capabilities.
+- **When asked to perform security testing**, use `run_command` to execute tools like nmap, sqlmap, nikto, or write custom testing scripts to verify vulnerabilities.
+- **When user asks to "shrink memory/history"**, that is handled by the /shrink command — tell them to use `/shrink`.
+- **Translate commands automatically.** If user says `ls`, run `dir`. If user says `cat`, run `type`. NEVER refuse or say "you should use X instead" — just run the right command.
+- **Task with 3+ steps** → call `emit_plan` FIRST to show the plan, then execute it step by step.
 
 ## RESPONSE STYLE
 - Use markdown: headers, **bold**, `code`, tables
 - Always include language tag on code blocks: ```python, ```bash
 - Summarize command output clearly
-- After finishing: confirm what was done + suggest next steps{mem_block}{ws_block}
+- After finishing: confirm what was done + suggest next steps{mem_block}
 """
+
+
+# ── Shrink History ─────────────────────────────────────────────────────────────
+def shrink_history_agent(history: list, model_key: str, keep: int = 10, manual: bool = False) -> list:
+    if not manual and len(history) < 100:
+        return history
+    
+    if manual:
+        status_line("Manually shrinking history...", "info")
+    else:
+        status_line("History reached 100 messages. Summarizing to save tokens...", "info")
+        
+    client, key, label = _rotator.get()
+    if not client: return history[-50:] # fallback
+    
+    api_model = MODELS.get(model_key, MODELS[DEFAULT_MODEL])
+    
+    text_to_summarize = ""
+    for h in history[:-keep]:
+        role = "User" if h["role"] == "user" else "Agent"
+        text_to_summarize += f"{role}: {h['content']}\n\n"
+        
+    prompt = f"Please provide a concise but comprehensive summary of the following conversation history. Retain key facts, decisions, and context.\n\n{text_to_summarize}"
+    
+    try:
+        resp = client.models.generate_content(model=api_model, contents=prompt)
+        summary = resp.text
+        
+        new_history = [{"role": "assistant", "content": f"**[System: History Summary]**\n{summary}", "ts": datetime.now().isoformat()}]
+        new_history.extend(history[-keep:])
+        return new_history
+    except Exception as ex:
+        status_line(f"Failed to shrink history: {ex}", "warning")
+        return history[-50:] # fallback
 
 # ── Agent loop ─────────────────────────────────────────────────────────────────
 def run_agent(
@@ -769,13 +834,16 @@ def run_agent(
     history:   list,
     model_key: str,
     mode_key:  str,
-    workspace: str | None = None,
 ) -> list:
     """One full agentic turn. Returns updated history."""
 
+    if not _GENAI:
+        status_line("google-genai is not installed. Run: pip install google-genai", "error")
+        return history
+
     client, key, label = _rotator.get()
     if not client:
-        status_line("No API keys found. Run:  python run.py --addapi", "error")
+        status_line("No API keys found. Run:  python run.py --addapi  or type /addapi", "error")
         return history
 
     api_model = MODELS.get(model_key, MODELS[DEFAULT_MODEL])
@@ -783,7 +851,7 @@ def run_agent(
 
     # Generation config
     cfg_kw: dict = dict(
-        system_instruction=build_sys_prompt(workspace),
+        system_instruction=build_sys_prompt(),
         tools=[_build_tools()],
         tool_config=gtypes.ToolConfig(
             function_calling_config=gtypes.FunctionCallingConfig(mode="AUTO")
@@ -889,57 +957,51 @@ def run_agent(
                 if name == "run_command":
                     cmd  = args.get("command", "")
                     desc = args.get("description", "Running…")
-                    cwd  = args.get("cwd", workspace)
+                    cwd  = args.get("cwd", None)
                     print_tool_call(name, desc, cmd)
                     out, rc = run_cmd_stream(cmd, cwd)
                     result  = {"output": out[:3000], "returncode": rc, "success": rc == 0}
                 else:
                     labels = {
-                        "read_file":       f"Reading {args.get('path','?')}",
-                        "write_file":      f"Writing {args.get('path','?')}",
-                        "list_directory":  f"Listing {args.get('path','?')}",
-                        "analyze_project": f"Analyzing {args.get('path','?')}",
-                        "web_search":      f"Searching: {args.get('query','?')}",
-                        "save_memory":     f"Saving memory",
-                        "emit_plan":       f"Planning: {args.get('title','?')}",
+                        "read_file":        f"Reading {args.get('path','?')}",
+                        "write_file":       f"Writing {args.get('path','?')}",
+                        "scan_project":     f"Scanning {args.get('path','?')}",
+                        "multi_edit_files": f"Editing {len(args.get('edits',[])) if isinstance(args.get('edits'), list) else '?'} file(s)",
+                        "web_search":       f"Searching: {args.get('query','?')}",
+                        "save_memory":      f"Saving memory",
+                        "emit_plan":        f"Planning: {args.get('title','?')}",
                     }
                     print_tool_call(name, labels.get(name, name))
-                    result = dispatch_tool(name, args, workspace)
+                    result = dispatch_tool(name, args)
 
                     # Pretty display
-                    if name == "list_directory" and "tree" in result:
-                        tree = result["tree"][:2000]
-                        if _RICH: _con.print(f"[dim]{tree}[/]")
-                        else:     print(f"{D}{tree}{R}")
-                    elif name == "read_file" and "content" in result:
+                    if name == "read_file" and "content" in result:
                         preview = result["content"][:600]
                         lang    = Path(args.get("path","")).suffix.lstrip(".")
                         if _RICH:
                             try:   _con.print(Syntax(preview, lang or "text", theme="monokai", line_numbers=True))
                             except: _con.print(f"[dim]{preview}[/]")
                         else: print(f"{YW}{preview}{R}")
-                    elif name == "analyze_project":
-                        if _RICH:
-                            t = Table(show_header=False, box=rbox.SIMPLE, border_style="dim")
-                            t.add_column(style="#60b8ff"); t.add_column()
-                            for k, v in result.items():
-                                if k not in ("deps",) and v:
-                                    t.add_row(k, str(v)[:80])
-                            if result.get("deps"):
-                                t.add_row("deps", ", ".join(result["deps"][:10]))
-                            _con.print(t)
-                        else:
-                            for k, v in result.items():
-                                if v and k != "deps":
-                                    print(f"  {CY}{k:<18}{R}{v}")
-                            if result.get("deps"):
-                                print(f"  {CY}{'deps':<18}{R}{', '.join(result['deps'][:10])}")
+                    elif name == "write_file" and result.get("success"):
+                        status_line(f"Written \u2192 {result.get('path','?')}  ({result.get('lines',0)} lines)", "success")
+                    elif name == "scan_project" and "file_tree" in result:
+                        tree = result["file_tree"][:2000]
+                        cnt  = result.get("file_count", 0)
+                        status_line(f"Scanned {cnt} files", "success")
+                        if _RICH: _con.print(f"[dim]{tree}[/]")
+                        else:     print(f"{D}{tree}{R}")
+                    elif name == "multi_edit_files" and "results" in result:
+                        for line in result["results"].split("\n"):
+                            if "Successfully" in line:
+                                status_line(line, "success")
+                            elif "not found" in line or "Error" in line:
+                                status_line(line, "error")
+                            else:
+                                status_line(line, "info")
                     elif name == "web_search" and "results" in result:
                         for res in result["results"][:3]:
                             if _RICH: _con.print(f"  [bold #60b8ff]{res.get('title','')[:70]}[/]\n  [dim]{res.get('snippet','')[:220]}[/]\n")
                             else:     print(f"  {CY}{res.get('title','')[:70]}{R}\n  {D}{res.get('snippet','')[:220]}{R}\n")
-                    elif name == "write_file" and result.get("success"):
-                        status_line(f"Written → {result.get('path','?')}  ({result.get('lines',0)} lines)", "success")
                     elif name == "save_memory" and result.get("saved"):
                         status_line("Memory saved", "success")
                     elif "error" in result:
@@ -1035,19 +1097,26 @@ def main():
     # Session state
     model     = args.model or DEFAULT_MODEL
     mode      = args.mode  or DEFAULT_MODE
-    workspace = None     # set via /workspace command or auto-detected
     history   = [] if args.clear else load_history()
 
     # One-shot mode (like `gemini -m flash "hello"`)
     if args.message:
         _rotator.reload()
-        run_agent(args.message, history, model, mode, workspace)
+        history = run_agent(args.message, history, model, mode)
+        save_history(history)
         return
 
     # Interactive REPL
+    if not _PTK:
+        print("\n  [ERR]  prompt-toolkit not installed.")
+        print("         Run:  pip install prompt-toolkit\n")
+        return
+
     print_banner()
     status_line(f"Model: {model}  Mode: {mode}  Shell: {SHELL_LABEL}", "info")
     status_line("Type /help for commands.  Ctrl+C or /exit to quit.", "info")
+    if not _GENAI:
+        status_line("google-genai is missing — install it before chatting: pip install google-genai", "warning")
     if not load_keys():
         status_line("No API keys — type /addapi to add one.", "warning")
     if history:
@@ -1057,7 +1126,6 @@ def main():
     
     while True:
         # Build prompt line
-        ws_name   = Path(workspace).name if workspace else "no-ws"
         mo_icon   = MODES[mode]["icon"]
         style = get_prompt_style(mode)
 
@@ -1133,12 +1201,20 @@ def main():
                     status_line(f"Unknown mode. Options: {', '.join(MODES)}", "error")
 
         elif low == "/clear":
+            history = []
+            save_history(history)
             os.system("cls" if IS_WIN else "clear")
             print_banner()
-
+            status_line("Conversation cleared.", "success")
         elif low == "/clearhistory":
             history = []
             save_history(history)
+            status_line("Message history cleared.", "success")
+
+        elif low == "/shrink":
+            history = shrink_history_agent(history, model, keep=5, manual=True)
+            save_history(history)
+            status_line("History shrunk.", "success")
 
         elif low == "/history":
             if not history:
@@ -1178,26 +1254,9 @@ def main():
             else:
                 status_line("Usage: /addmem <text>", "warning")
 
-        elif low.startswith("/workspace"):
-            parts = user_input.split(maxsplit=1)
-            if len(parts) == 1:
-                status_line(f"Workspace: {workspace or 'none (using cwd)'}", "info")
-            else:
-                p = Path(parts[1].strip()).expanduser()
-                if p.is_dir():
-                    workspace = str(p)
-                    status_line(f"Workspace → {workspace}", "success")
-                else:
-                    try:
-                        p.mkdir(parents=True)
-                        workspace = str(p)
-                        status_line(f"Created & set workspace → {workspace}", "success")
-                    except Exception as ex:
-                        status_line(f"Cannot use path: {ex}", "error")
-
         elif low.startswith("/run "):
             cmd = user_input[5:].strip()
-            if cmd: run_cmd_stream(cmd, workspace)
+            if cmd: run_cmd_stream(cmd)
 
         elif low.startswith("/read "):
             path = user_input[6:].strip()
@@ -1212,58 +1271,6 @@ def main():
                 else:
                     print(f"{YW}{result['content'][:3000]}{R}")
 
-        elif low.startswith("/write "):
-            path = user_input[7:].strip()
-            if not path:
-                status_line("Usage: /write <filepath>", "warning")
-            else:
-                print(f"  {D}Enter content (Ctrl+D / empty line × 2 to finish):{R}")
-                lines_in, empty_count = [], 0
-                while True:
-                    try:
-                        line = input()
-                        if line == "":
-                            empty_count += 1
-                            if empty_count >= 2: break
-                        else:
-                            empty_count = 0
-                        lines_in.append(line)
-                    except EOFError:
-                        break
-                content = "\n".join(lines_in)
-                result  = _impl_write({"path": path, "content": content})
-                if result.get("success"):
-                    status_line(f"Written → {path}  ({result.get('lines',0)} lines)", "success")
-                else:
-                    status_line(result.get("error","Failed"), "error")
-
-        elif low.startswith("/ls"):
-            p = user_input[3:].strip() or (workspace or ".")
-            result = _impl_ls({"path": p})
-            if "tree" in result:
-                if _RICH: _con.print(f"[dim]{result['tree']}[/]")
-                else:     print(f"{D}{result['tree']}{R}")
-            else:
-                status_line(result.get("error", "?"), "error")
-
-        elif low.startswith("/analyze "):
-            p = user_input[9:].strip()
-            result = _impl_analyze({"path": p})
-            if "error" in result:
-                status_line(result["error"], "error")
-            else:
-                if _RICH:
-                    t = Table(show_header=False, box=rbox.SIMPLE, border_style="dim")
-                    t.add_column(style="#60b8ff", no_wrap=True); t.add_column()
-                    for k, v in result.items():
-                        if k == "deps": v = ", ".join(v[:10]) if v else "—"
-                        t.add_row(k, str(v) if v else "—")
-                    _con.print(t)
-                else:
-                    for k, v in result.items():
-                        if k == "deps": v = ", ".join(v[:10]) if v else "—"
-                        print(f"  {CY}{k:<18}{R}{v or '—'}")
-
         elif low.startswith("/search "):
             q = user_input[8:].strip()
             result = _impl_search({"query": q})
@@ -1276,17 +1283,38 @@ def main():
             if not result.get("results"):
                 status_line("No results.", "info")
 
+        elif low.startswith("/scan"):
+            # Extract path and feed to agent as an explicit scan request
+            scan_path = user_input[5:].strip() or "."
+            user_input = f"Scan the project at path: {scan_path} — use the scan_project tool on that path. Show the file tree and analyze the tech stack (languages, frameworks, DB, etc)."
+            esc_killer = EscInterrupter()
+            esc_killer.start()
+            try:
+                history = run_agent(user_input, history, model, mode)
+                history = shrink_history_agent(history, model)
+                save_history(history)
+            except KeyboardInterrupt:
+                print()
+                status_line("Interrupted.", "warning")
+            finally:
+                esc_killer.stop()
+
         elif low.startswith("/"):
             status_line(f"Unknown command: {user_input}  →  /help", "warning")
 
         # ── Agent call ─────────────────────────────────────────────────────────
         else:
+            esc_killer = EscInterrupter()
+            esc_killer.start()
             try:
-                history = run_agent(user_input, history, model, mode, workspace)
+                history = run_agent(user_input, history, model, mode)
+                history = shrink_history_agent(history, model)
                 save_history(history)
             except KeyboardInterrupt:
                 print()
                 status_line("Interrupted.", "warning")
+            finally:
+                esc_killer.stop()
 
 if __name__ == "__main__":
     main()

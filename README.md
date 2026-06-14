@@ -45,11 +45,12 @@ Both modes share the same **8 agentic tools**, persistent memory engine, and `.e
 | | Feature | Description |
 |-|---------|-------------|
 | 🗂️ | **Workspaces** | Claude Projects-style context — path browser, per-workspace memory, framework detection |
-| 🤖 | **8 Agent Tools** | Shell, file R/W, directory tree, project analyzer, web search, memory, planner |
+| 🤖 | **8 Agent Tools** | Shell, read_file, write_file, scan_project, multi_edit_files, web_search, save_memory, emit_plan |
+| 📝 | **Multi-File Editing** | Precise find-and-replace patching across multiple files autonomously |
 | 🧠 | **Persistent Memory** | Global, workspace-scoped, and auto-extracted memories across sessions |
 | 💻 | **Multi-tab Terminals** | Live streaming, stdin injection, ↑↓ command history, 2-stage kill |
 | 🔑 | **API Key Rotation** | Multiple keys, auto-rotate on quota, pin a key, per-key usage stats |
-| 🔒 | **Security Testing** | nmap, nikto, gobuster, sqlmap, hydra, metasploit — built-in workflows |
+| 🔒 | **Security Testing** | Autonomous vulnerability scanning, logic flaw detection (XSS/SQLi), nmap, metasploit built-in workflows |
 | 🌐 | **Web Search** | DuckDuckGo instant answers — no extra API key required |
 | ✏️ | **Message Editing** | Edit any past message and re-run the agent from that point |
 | ⏹️ | **Stop Generation** | Cancel agent mid-flight at any time |
@@ -107,7 +108,7 @@ agent2/
 ### 1 — Clone
 
 ```bash
-git https://github.com/aaravshah1311/Agent-2-Beta.git
+git clone https://github.com/aaravshah1311/Agent-2-Beta.git
 cd Agent-2-Beta
 ```
 
@@ -129,16 +130,18 @@ python run.py
 
 ## ▶️ Run Modes
 
-### `run.py` — all flags at a glance
+### `agent2` command — all flags at a glance
+
+After the initial installation, the `agent2` command is added to your PATH globally.
 
 ```
-python run.py                 setup + start Web UI  (default)
-python run.py --web           setup + start Web UI
-python run.py --cli           setup + start CLI agent
-python run.py --addapi        add / manage API keys
-python run.py --reset         wipe venv and reinstall everything
-python run.py --uninstall     completely remove Agent2 and its venv
-python run.py -h              show this help menu
+agent2                 setup + start Web UI  (default)
+agent2 --web           setup + start Web UI
+agent2 --cli           setup + start CLI agent
+agent2 --addapi        add / manage API keys
+agent2 --reset         wipe venv and reinstall everything
+agent2 --uninstall     completely remove Agent2 and its venv
+agent2 -h              show this help menu
 ```
 
 ---
@@ -146,9 +149,9 @@ python run.py -h              show this help menu
 ### 🌐 Web UI
 
 ```bash
-python run.py
+agent2
 # or explicitly
-python run.py --web
+agent2 --web
 ```
 
 Opens at → **http://localhost:1311**
@@ -158,7 +161,7 @@ Opens at → **http://localhost:1311**
 ### ⚡ CLI Agent
 
 ```bash
-python run.py --cli
+agent2 --cli
 ```
 
 Or call directly after first setup:
@@ -171,23 +174,14 @@ venv/bin/python agent2cli.py
 venv\Scripts\python agent2cli.py
 ```
 
-**One-shot mode** (pipe-friendly, just like `gemini -m flash "..."`):
-
-```bash
-venv/bin/python agent2cli.py "portscan 10.10.1.1"
-venv/bin/python agent2cli.py --model 2.5-flash "explain this error"
-venv/bin/python agent2cli.py --mode thinking "design this architecture"
-venv/bin/python agent2cli.py --clear "start a fresh session"
-```
-
 ---
 
 ## 🔑 Managing API Keys
 
-### Via `run.py` — recommended
+### Via `agent2` — recommended
 
 ```bash
-python run.py --addapi
+agent2 --addapi
 ```
 
 Walks you through adding keys interactively and saves them to `.env`.  
@@ -204,7 +198,7 @@ Paste a new key without leaving the session — saved to `.env` immediately and 
 ### Reset everything
 
 ```bash
-python run.py --reset
+agent2 --reset
 ```
 
 Wipes `venv/` and reinstalls all dependencies. Use when packages break or Python is upgraded.
@@ -212,7 +206,7 @@ Wipes `venv/` and reinstalls all dependencies. Use when packages break or Python
 ### Full uninstall
 
 ```bash
-python run.py --uninstall
+agent2 --uninstall
 ```
 
 Removes the virtual environment and generated files, leaving source code intact.
@@ -240,15 +234,14 @@ Every chat belongs to a workspace. The agent always knows your project path, det
 | `/model [name]` | Switch model (`2.5-flash-lite` · `2.5-flash` · `2.5-pro` · `3.1-*`) |
 | `/mode [name]` | Switch mode (`fast ⚡` · `pro ★` · `thinking 🧠`) |
 | `/clear` | Clear current conversation and start fresh |
+| `/shrink` | Summarize and shrink history manually |
+| `/clearhistory` | Clear message history |
 | `/history` | Show last 10 messages |
 | `/memory` | List all saved memories with importance scores |
 | `/addmem <text>` | Save a memory manually |
-| `/workspace [path]` | Show or set working directory for commands |
-| `/run <cmd>` | Run a shell command directly in the current workspace |
+| `/scan [path]` | Scan and analyze entire project directory, tech stack, and structure |
+| `/run <cmd>` | Run a shell command directly |
 | `/read <file>` | Read and display a file's contents |
-| `/write <file>` | Write text to a file (prompts for content) |
-| `/ls [path]` | Display a recursive directory tree |
-| `/analyze <path>` | Detect framework / language / dependencies / run command |
 | `/search <query>` | Web search via DuckDuckGo (no key required) |
 | `/exit` · `Ctrl+C` | Quit |
 

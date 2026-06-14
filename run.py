@@ -145,6 +145,9 @@ def ensure_venv(reset=False):
             except Exception as e:
                 print(f"\n  {r('[ERR]')}  Reset failed: {e}")
                 sys.exit(1)
+            
+            for cache in ROOT.rglob("__pycache__"):
+                shutil.rmtree(cache, ignore_errors=True)
 
     # ── 🛠️ Venv Creation ─────────────────────────────────────────────────────
     print(f"\n  {w('[ Virtual Environment ]')}\n")
@@ -320,10 +323,15 @@ def add_api():
     print(f"\n  {g('[DONE]')}  Total keys in .env: {len(_load_keys())}")
 
 def uninstall():
-    """Wipe everything: .venv, .env, agent2.db, and __pycache__"""
+    """Wipe everything: .venv, .env, agent2.db, __pycache__, and global command"""
     banner()
-    print(f"  {r('[ WARNING ]')}  {w('This will delete all keys, data, and the environment.')}")
-    ans = input(f"  {CY}>>>{R} Are you absolutely sure? [y/N]: ").strip().lower()
+    print(f"  {r('[ WARNING ]')}  {w('This will delete all keys, data, the environment, and global commands.')}")
+    try:
+        ans = input(f"  {CY}>>>{R} Are you absolutely sure? [y/N]: ").strip().lower()
+    except KeyboardInterrupt:
+        print(f"\n  {g('[OK]')}  Uninstall aborted.")
+        return
+
     if ans != 'y':
         print(f"\n  {g('[OK]')}  Uninstall aborted.")
         return
@@ -341,6 +349,21 @@ def uninstall():
                 print(f"  {g('[OK]')}  Deleted: {dim(path.name)}")
             except Exception as e:
                 print(f"  {y('[!]')}  Could not delete {path.name}: {e}")
+
+    # Clean up global command
+    bin_dir = Path.home() / ".local" / "bin"
+    if IS_WIN and not bin_dir.exists():
+        import site
+        bin_dir = Path(site.getuserbase()) / "Scripts"
+    
+    for cmd in ["agent2", "agent2.bat"]:
+        cmd_path = bin_dir / cmd
+        if cmd_path.exists():
+            try:
+                cmd_path.unlink()
+                print(f"  {g('[OK]')}  Deleted global command: {dim(cmd)}")
+            except Exception:
+                pass
 
     # Clean up python caches
     for cache in ROOT.rglob("__pycache__"):
@@ -365,6 +388,33 @@ def check_tools():
         else:
             hint = win if IS_WIN else (mac if IS_MAC else linux)
             print(f"  {y('[!]')}  {tool} {dim('not found')}  →  {dim(hint)}")
+
+# ── Step 5b: Global Command ───────────────────────────────────────────────────
+def install_global_command():
+    print(f"\n  {w('[ Global Command ]')}\n")
+    bin_dir = Path.home() / ".local" / "bin"
+    if IS_WIN and not bin_dir.exists():
+        import site
+        bin_dir = Path(site.getuserbase()) / "Scripts"
+    
+    try:
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        run_path = ROOT / "run.py"
+        
+        if IS_WIN:
+            cmd_path = bin_dir / "agent2.bat"
+            content = f'@echo off\nif "%~1"=="" (\n    "{sys.executable}" "{run_path}" --cli\n) else (\n    "{sys.executable}" "{run_path}" %*\n)\n'
+            cmd_path.write_text(content, encoding="utf-8")
+        else:
+            cmd_path = bin_dir / "agent2"
+            content = f'#!/usr/bin/env bash\nif [ $# -eq 0 ]; then\n    "{sys.executable}" "{run_path}" --cli\nelse\n    "{sys.executable}" "{run_path}" "$@"\nfi\n'
+            cmd_path.write_text(content, encoding="utf-8")
+            cmd_path.chmod(0o755)
+            
+        print(f"  {g('[OK]')}  Command installed: {c('agent2')} {dim('(' + str(cmd_path) + ')')}")
+        print(f"         {dim('(Ensure this directory is in your PATH)')}")
+    except Exception as e:
+        print(f"  {y('[!]')}  Failed to install global command: {e}")
 
 # ── Step 6: Launch ─────────────────────────────────────────────────────────────
 def launch_web():
@@ -437,6 +487,7 @@ def main():
 
     ensure_keys()
     check_tools()
+    install_global_command()
 
     # ── Mode Selection ───────────────────────────────────────────────────────
     if do_cli:
@@ -481,4 +532,8 @@ def main():
             launch_web()
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(f"\n  \033[2mStopped by user (Ctrl+C).\033[0m")
+        sys.exit(0)

@@ -343,6 +343,7 @@ Supports: `nmap`, `nikto`, `gobuster`, `ffuf`, `sqlmap`, `hydra`, `metasploit`,
 | 8 Agent Tools | ✅ | ✅ Extended |
 | Memory Engine | ✅ | ✅ Advanced |
 | Multi-tab Terminals | ✅ | ✅ |
+| **AI Models** | 6 ✅ | 15 ✅ |
 | **Full-project generation from one prompt** | ❌ | ✅ |
 | **Software Engineering mode** | ❌ | ✅ |
 | **DeepDive — task decomposition** | ❌ | ✅ |
